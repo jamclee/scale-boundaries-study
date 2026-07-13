@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<!--
+  Standalone drag-into-bins sort widget. Deploy this whole github_pages/
+  folder to GitHub Pages, then this file gets loaded in an <iframe> by the
+  Qualtrics bridge script (see ../qualtrics_bridge/sort_bridge.js).
+
+  This page is generic on purpose -- it doesn't know about "Stage 1 / Stage
+  2" or Qualtrics field names. It's just handed a list of items to sort and
+  reports back what the respondent did with them. All the study-specific
+  logic (which items to show, where results get saved, the adaptive zoom
+  calculation) lives in the Qualtrics bridge script.
+
+  Reads config from URL query params:
+    items             comma-separated item labels to sort (e.g. "1,2,3,4,5")
+    context_negative  comma-separated labels shown pre-placed in the negative
+                       bin as locked (non-draggable) reference chips
+    context_neutral   same, for the neutral bin
+    context_positive  same, for the positive bin
+
+  The context_* params exist for Stage-2 adaptive zoom questions, so
+  respondents can see what they already decided in Stage 1 (e.g. "3 was
+  negative, 4 was positive") while placing the new finer-grained values.
+
+  Interaction: click/tap a chip to select it (click again to deselect).
+  Dragging a selected chip moves every selected chip together into the
+  target bin; dragging an unselected chip moves just that one. A plain
+  click never moves a chip -- only a real drag (movement past a small
+  threshold) does, so tapping to select doesn't accidentally reorder things.
+
+  Example: sort.html?items=1,2,3,4,5
+           sort.html?items=3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9&context_negative=3&context_positive=4
+
+  While sorting, postMessages progress to the parent window:
+    { type: "srx-sort-progress", complete: false, assignments: {...} }
+  Once every item has been placed in a bin:
+    { type: "srx-sort-complete", assignments: { "<item>": "negative|neutral|positive", ... } }
+
+  You can open this file directly in a browser (with a query string) to test
+  and debug it with normal dev tools -- no Qualtrics involved.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Sort task</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; }
+  .srx-sort-root { max-width: 720px; margin: 20px auto; }
+  .srx-sort-pool {
+    display: flex; flex-wrap: wrap; gap: 8px; min-height: 50px; padding: 10px;
+    border: 1px dashed #bbb; border-radius: 8px; margin-bottom: 16px;
+  }
+  .srx-chip {
+    padding: 8px 14px; border: 2px solid #333; border-radius: 20px; background: #f5f5f5;
+    cursor: grab; user-select: none; touch-action: none; font-size: 14px;
+  }
+  .srx-chip.dragging { opacity: 0.4; }
+  .srx-chip-locked {
+    cursor: default; opacity: 0.65; border-style: dashed; background: #eee;
+  }
+  .srx-chip-selected {
+    border-color: #337ab7; background: #eaf3fc; box-shadow: 0 0 0 2px rgba(51, 122, 183, 0.35);
+  }
+  .srx-bins { display: flex; gap: 12px; }
+  .srx-bin { flex: 1; }
+  .srx-bin-label { text-align: center; font-weight: 600; margin-bottom: 6px; }
+  .srx-bin-neg { color: #d9534f; }
+  .srx-bin-neu { color: #777; }
+  .srx-bin-pos { color: #5cb85c; }
+  .srx-bin-drop {
+    min-height: 120px; border: 2px solid #ccc; border-radius: 8px; padding: 8px;
+    display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start;
+  }
+  .srx-bin-drop.dragover { border-color: #337ab7; background: #eef5fc; }
+</style>
+</head>
+<body>
+<div id="srx-sort-root" class="srx-sort-root">
+  <div id="srx-sort-pool" class="srx-sort-pool"></div>
+  <div class="srx-bins">
+    <div class="srx-bin" data-bin="negative">
+      <div class="srx-bin-label srx-bin-neg">Negative</div>
+      <div class="srx-bin-drop" id="srx-bin-negative"></div>
+    </div>
+    <div class="srx-bin" data-bin="neutral">
+      <div class="srx-bin-label srx-bin-neu">Neutral</div>
+      <div class="srx-bin-drop" id="srx-bin-neutral"></div>
+    </div>
+    <div class="srx-bin" data-bin="positive">
+      <div class="srx-bin-label srx-bin-pos">Positive</div>
+      <div class="srx-bin-drop" id="srx-bin-positive"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var qs = new URLSearchParams(window.location.search);
+  var itemsRaw = qs.get("items") || "";
+  var items = itemsRaw
+    ? itemsRaw.split(",").map(function (s) { return s.trim(); }).filter(Boolean)
+    : [];
+
+  var root = document.getElementById("srx-sort-root");
+  var pool = document.getElementById("srx-sort-pool");
+  var bins = {
+    negative: document.getElementById("srx-bin-negative"),
+    neutral:  document.getElementById("srx-bin-neutral"),
+    positive: document.getElementById("srx-bin-positive")
+  };
+  var assignment = {}; // item label -> bin name | null (still in pool)
+
+  if (items.length === 0) {
+    // In production the Qualtrics bridge script never loads this iframe with
+    // an empty item list (it shows its own message instead) -- if you're
+    // seeing this while testing standalone, the URL is missing ?items=.
+    root.innerHTML =
+      "<p style=\"color:#d9534f;font-family:monospace;\">No <code>items</code> in the URL. " +
+      "Try e.g. <code>?items=1,2,3,4,5</code>.</p>";
+    window.parent.postMessage({ type: "srx-sort-complete", assignments: {} }, "*");
+    return;
+  }
+
+  function makeChip(label) {
+    var chip = document.createElement("div");
+    chip.className = "srx-chip";
+    chip.textContent = label;
+    chip.dataset.item = label;
+    chip.setAttribute("tabindex", "0");
+    attachDrag(chip);
+    return chip;
+  }
+
+  items.forEach(function (label) {
+    assignment[label] = null;
+    pool.appendChild(makeChip(label));
+  });
+
+  // Stage-2-style reference context: labels already decided in an earlier
+  // stage, shown pre-placed in their bin but not draggable -- so a respondent
+  // can see "3 was negative, 4 was positive" while placing the new values.
+  function makeLockedChip(label) {
+    var chip = document.createElement("div");
+    chip.className = "srx-chip srx-chip-locked";
+    chip.textContent = label;
+    chip.dataset.item = label;
+    chip.title = "From an earlier sort -- not movable here";
+    return chip;
+  }
+
+  function parseList(param) {
+    var raw = qs.get(param) || "";
+    return raw.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  // Original position in the `items` list stands in for scale order when a
+  // label isn't a plain number (grades, "Poor"/"Fair"/etc.) -- the URL is
+  // expected to list items in low-to-high scale order already.
+  var itemIndex = {};
+  items.forEach(function (label, i) { itemIndex[label] = i; });
+
+  function isNumeric(label) { return label !== "" && !isNaN(Number(label)); }
+
+  // A plain number sorts by its value. A "lo-hi" range-label chip (the
+  // locked Stage-1 context chips, e.g. "4.0-5.0") sorts by its lower bound,
+  // so it correctly falls after everything below it and before anything
+  // above it. Anything else (grades, "Poor"/"Fair"/etc.) falls back to its
+  // original position in the `items` list, which is expected to already be
+  // in low-to-high scale order.
+  function sortValue(label) {
+    if (isNumeric(label)) return Number(label);
+    var parts = label.split("-");
+    if (parts.length === 2 && isNumeric(parts[0]) && isNumeric(parts[1])) {
+      return Number(parts[0]);
+    }
+    return itemIndex[label] !== undefined ? itemIndex[label] : 0;
+  }
+
+  function compareItems(a, b) {
+    return sortValue(a) - sortValue(b);
+  }
+
+  // Re-sort a bin's chips low-to-high after a drop lands in it, purely for
+  // readability -- doesn't affect which bin an item is assigned to.
+  function sortBin(container) {
+    var chips = Array.prototype.slice.call(container.querySelectorAll(".srx-chip"));
+    chips.sort(function (a, b) { return compareItems(a.dataset.item, b.dataset.item); });
+    chips.forEach(function (chip) { container.appendChild(chip); });
+  }
+
+  [
+    ["context_negative", bins.negative],
+    ["context_neutral", bins.neutral],
+    ["context_positive", bins.positive]
+  ].forEach(function (pair) {
+    var labels = parseList(pair[0]);
+    labels.forEach(function (label) { pair[1].appendChild(makeLockedChip(label)); });
+    if (labels.length > 0) sortBin(pair[1]);
+  });
+
+  function allDropEls() { return [pool, bins.negative, bins.neutral, bins.positive]; }
+
+  // Distinguishes a real drag from a plain click/tap -- without this, a
+  // simple click still ran the "drop" logic below (elementFromPoint at the
+  // click location just returns the chip's own current container), which
+  // silently re-appended the chip to the end of that container. That's
+  // invisible in a bin (sortBin puts it back in place) but very visible in
+  // the pool, which isn't auto-sorted -- clicking any pool chip sent it to
+  // the end of the sequence.
+  var DRAG_THRESHOLD = 5; // px
+
+  function attachDrag(chip) {
+    chip.addEventListener("pointerdown", function (e) {
+      var startX = e.clientX, startY = e.clientY;
+      var moved = false;
+      var isSelected = chip.classList.contains("srx-chip-selected");
+      // Dragging an already-selected chip carries the whole selection along;
+      // dragging an unselected chip (even if other chips are selected) only
+      // moves that one chip.
+      var dragSet = isSelected
+        ? Array.prototype.slice.call(document.querySelectorAll(".srx-chip-selected"))
+        : [chip];
+
+      chip.setPointerCapture(e.pointerId);
+
+      function onMove(ev) {
+        if (!moved) {
+          if (Math.abs(ev.clientX - startX) < DRAG_THRESHOLD && Math.abs(ev.clientY - startY) < DRAG_THRESHOLD) return;
+          moved = true;
+          dragSet.forEach(function (c) { c.classList.add("dragging"); });
+        }
+        allDropEls().forEach(function (b) { b.classList.remove("dragover"); });
+        var el = document.elementFromPoint(ev.clientX, ev.clientY);
+        var target = el && el.closest(".srx-bin-drop, .srx-sort-pool");
+        if (target) target.classList.add("dragover");
+      }
+
+      function onUp(ev) {
+        allDropEls().forEach(function (b) { b.classList.remove("dragover"); });
+        dragSet.forEach(function (c) { c.classList.remove("dragging"); });
+        chip.removeEventListener("pointermove", onMove);
+        chip.removeEventListener("pointerup", onUp);
+
+        if (!moved) {
+          // Plain click/tap: toggle this chip's selection, don't move it.
+          chip.classList.toggle("srx-chip-selected");
+          return;
+        }
+
+        var el = document.elementFromPoint(ev.clientX, ev.clientY);
+        var target = el && el.closest(".srx-bin-drop, .srx-sort-pool");
+        if (target) {
+          dragSet.forEach(function (c) {
+            target.appendChild(c);
+            c.classList.remove("srx-chip-selected");
+            assignment[c.dataset.item] =
+              target.id === "srx-sort-pool" ? null : target.id.replace("srx-bin-", "");
+          });
+          if (target.id !== "srx-sort-pool") sortBin(target);
+        }
+        report();
+      }
+
+      chip.addEventListener("pointermove", onMove);
+      chip.addEventListener("pointerup", onUp);
+    });
+  }
+
+  function report() {
+    var allSorted = items.every(function (label) { return assignment[label]; });
+    var msg = {
+      type: allSorted ? "srx-sort-complete" : "srx-sort-progress",
+      complete: allSorted,
+      assignments: assignment
+    };
+    window.parent.postMessage(msg, "*");
+  }
+
+  window.parent.postMessage({ type: "srx-sort-ready" }, "*");
+  report(); // initial state: nothing sorted
+})();
+</script>
+</body>
+</html>
