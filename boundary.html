@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<!--
+  Standalone boundary ("box") drag widget. Deploy this whole github_pages/
+  folder to GitHub Pages, then this file gets loaded in an <iframe> by the
+  Qualtrics bridge script (see ../qualtrics_bridge/boundary_bridge.js).
+
+  Two modes, selected by the "mode" param:
+
+  mode=numeric (scales 5, 6, 10, 100)
+    Handles drag continuously across the real scale range, snapped to `step`,
+    with a live label above each handle showing its current value.
+      min    scale minimum (e.g. 1, or 0 for the 100-pt scale)
+      max    scale maximum (e.g. 5, 6, 10, or 100)
+      step   snap granularity (0.1 for 5/6/10-pt scales, 1 for the 100-pt scale)
+    Example: boundary.html?mode=numeric&min=1&max=5&step=0.1
+             boundary.html?mode=numeric&min=0&max=100&step=1
+
+  mode=categorical (scales A-F, Poor-Excellent)
+    Handles snap to one of the n+1 gaps between/around the given points (a
+    boundary sits *between* two points, never on one) -- unchanged from the
+    original discrete behavior.
+      points  comma-separated point labels, e.g. "A+,A,A-,B+,B,B-,C+,C,C-,D,F"
+    Example: boundary.html?mode=categorical&points=A%2B,A,A-,B%2B,B,B-,C%2B,C,C-,D,F
+
+  On every handle release, postMessages the result to the parent window:
+    { type: "srx-boundary-result", negVal, posVal, neutralWidth }
+
+  You can open this file directly in a browser (with a query string) to test
+  and debug it with normal dev tools -- no Qualtrics involved.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Boundary task</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; }
+  .srx-boundary-root { max-width: 700px; margin: 20px auto; }
+  .srx-track-wrap { position: relative; padding: 58px 10px 24px; }
+  .srx-track { position: relative; height: 12px; background: #d8dce0; border-radius: 6px; }
+  .srx-fill { position: absolute; top: 0; height: 12px; }
+  .srx-fill-neg { left: 0; background: #d9534f; border-radius: 6px 0 0 6px; }
+  .srx-fill-pos { right: 0; background: #5cb85c; border-radius: 0 6px 6px 0; }
+  .srx-handle {
+    position: absolute; top: -8px; width: 28px; height: 28px; margin-left: -14px;
+    border-radius: 50%; background: #fff; border: 3px solid #333; cursor: grab; touch-action: none;
+  }
+  .srx-handle:active { cursor: grabbing; }
+  .srx-handle-neg { border-color: #d9534f; }
+  .srx-handle-pos { border-color: #5cb85c; }
+  .srx-value-label {
+    position: absolute; transform: translateX(-50%); font-size: 13px;
+    font-weight: 600; padding: 2px 7px; border-radius: 4px; background: #333; color: #fff;
+    white-space: nowrap; pointer-events: none;
+  }
+  /* Staggered heights so the two labels don't overlap each other when the
+     handles are dragged close together; both sit closer to the track/handle
+     than a single shared height would allow. */
+  .srx-value-label-neg { background: #d9534f; top: -30px; }
+  .srx-value-label-pos { background: #5cb85c; top: -48px; }
+  .srx-ticks { position: relative; height: 20px; }
+  .srx-tick-label { position: absolute; transform: translateX(-50%); font-size: 12px; color: #555; white-space: nowrap; }
+  .srx-legend { display: flex; justify-content: center; gap: 24px; margin-top: 10px; font-size: 13px; }
+  .srx-legend-neg { color: #d9534f; }
+  .srx-legend-neu { color: #777; }
+  .srx-legend-pos { color: #5cb85c; }
+</style>
+</head>
+<body>
+<div id="srx-boundary-root" class="srx-boundary-root">
+  <div class="srx-track-wrap">
+    <div id="srx-track" class="srx-track">
+      <div id="srx-neg-fill" class="srx-fill srx-fill-neg"></div>
+      <div id="srx-pos-fill" class="srx-fill srx-fill-pos"></div>
+      <div id="srx-label-neg" class="srx-value-label srx-value-label-neg"></div>
+      <div id="srx-label-pos" class="srx-value-label srx-value-label-pos"></div>
+      <div id="srx-handle-neg" class="srx-handle srx-handle-neg" tabindex="0" role="slider" aria-label="Negative boundary"></div>
+      <div id="srx-handle-pos" class="srx-handle srx-handle-pos" tabindex="0" role="slider" aria-label="Positive boundary"></div>
+    </div>
+    <div id="srx-ticks" class="srx-ticks"></div>
+  </div>
+  <div class="srx-legend">
+    <span class="srx-legend-item srx-legend-neg">&#9632; Negative</span>
+    <span class="srx-legend-item srx-legend-neu">&#9632; Neutral</span>
+    <span class="srx-legend-item srx-legend-pos">&#9632; Positive</span>
+  </div>
+</div>
+<script>
+(function () {
+  var qs = new URLSearchParams(window.location.search);
+  var mode       = qs.get("mode") === "categorical" ? "categorical" : "numeric";
+  var scaleMin   = parseFloat(qs.get("min"));
+  var scaleMax   = parseFloat(qs.get("max"));
+  var step       = parseFloat(qs.get("step")) || 1;
+  var pointsRaw  = qs.get("points") || "";
+  var points     = pointsRaw ? pointsRaw.split(",").filter(Boolean) : [];
+  var n          = points.length;
+
+  // Numeric mode: handles drag directly in real scale units (e.g. 1.0-5.0).
+  // Categorical mode: edge positions represent the n+1 possible "gaps" a
+  // handle can sit in (before point 1, between each pair, after the last
+  // point) -- a boundary sits *between* two points, never on one.
+  var minEdge, maxEdge;
+  if (mode === "numeric") {
+    minEdge = scaleMin;
+    maxEdge = scaleMax;
+  } else {
+    minEdge = 0;
+    maxEdge = n;
+  }
+
+  if (!(maxEdge - minEdge > 0)) {
+    document.getElementById("srx-boundary-root").innerHTML =
+      "<p style=\"color:#d9534f;font-family:monospace;\">" +
+      "No valid scale range in the URL. For a numeric scale pass " +
+      "<code>mode=numeric&min=1&max=5&step=0.1</code>; for a categorical scale pass " +
+      "<code>mode=categorical&points=A,B,C,D,F</code>.</p>";
+    return;
+  }
+
+  var track     = document.getElementById("srx-track");
+  var handleNeg = document.getElementById("srx-handle-neg");
+  var handlePos = document.getElementById("srx-handle-pos");
+  var fillNeg   = document.getElementById("srx-neg-fill");
+  var fillPos   = document.getElementById("srx-pos-fill");
+  var labelNeg  = document.getElementById("srx-label-neg");
+  var labelPos  = document.getElementById("srx-label-pos");
+  var ticksWrap = document.getElementById("srx-ticks");
+
+  // Both boxes start collapsed (empty) -- an intentional drag is required to
+  // mark anything negative or positive.
+  var negVal = minEdge;
+  var posVal = maxEdge;
+
+  var stepDecimals = (function () {
+    var s = String(step);
+    var i = s.indexOf(".");
+    return i === -1 ? 0 : s.length - i - 1;
+  })();
+
+  function edgeToPct(v) { return ((v - minEdge) / (maxEdge - minEdge)) * 100; }
+  function clamp(v) { return Math.max(minEdge, Math.min(maxEdge, v)); }
+
+  function snap(v) {
+    if (mode === "categorical") return Math.round(v);
+    var snapped = Math.round(v / step) * step;
+    return parseFloat(snapped.toFixed(stepDecimals));
+  }
+
+  function formatValue(v) {
+    return mode === "numeric" ? v.toFixed(stepDecimals) : v;
+  }
+
+  function renderTicks() {
+    ticksWrap.innerHTML = "";
+    if (mode === "numeric") {
+      // One tick per whole scale point when the range is small enough to
+      // read (5/6/10-pt scales); just min/mid/max for wide ranges (100-pt).
+      var vals;
+      if (maxEdge - minEdge <= 10) {
+        vals = [];
+        for (var v = Math.ceil(minEdge); v <= maxEdge; v++) vals.push(v);
+      } else {
+        vals = [minEdge, (minEdge + maxEdge) / 2, maxEdge];
+      }
+      vals.forEach(function (v) {
+        var el = document.createElement("div");
+        el.className = "srx-tick-label";
+        el.style.left = edgeToPct(v) + "%";
+        el.textContent = v;
+        ticksWrap.appendChild(el);
+      });
+    } else {
+      points.forEach(function (label, i) {
+        var el = document.createElement("div");
+        el.className = "srx-tick-label";
+        el.style.left = edgeToPct(i + 0.5) + "%";
+        el.textContent = label;
+        ticksWrap.appendChild(el);
+      });
+    }
+  }
+
+  function render() {
+    handleNeg.style.left = edgeToPct(negVal) + "%";
+    handlePos.style.left = edgeToPct(posVal) + "%";
+    fillNeg.style.width = edgeToPct(negVal) + "%";
+    fillPos.style.width = (100 - edgeToPct(posVal)) + "%";
+
+    if (mode === "numeric") {
+      labelNeg.style.display = "";
+      labelPos.style.display = "";
+      labelNeg.style.left = edgeToPct(negVal) + "%";
+      labelPos.style.left = edgeToPct(posVal) + "%";
+      labelNeg.textContent = formatValue(negVal);
+      labelPos.textContent = formatValue(posVal);
+    } else {
+      // Categorical scales don't have a single numeric value to show.
+      labelNeg.style.display = "none";
+      labelPos.style.display = "none";
+    }
+  }
+
+  function pxToVal(clientX) {
+    var rect = track.getBoundingClientRect();
+    var pct = (clientX - rect.left) / rect.width;
+    return clamp(minEdge + pct * (maxEdge - minEdge));
+  }
+
+  function post() {
+    var msg = { type: "srx-boundary-result", negVal: negVal, posVal: posVal, neutralWidth: posVal - negVal };
+    window.parent.postMessage(msg, "*");
+  }
+
+  function makeDraggable(handle, isNeg) {
+    handle.addEventListener("pointerdown", function (e) {
+      handle.setPointerCapture(e.pointerId);
+
+      function onMove(ev) {
+        var v = snap(pxToVal(ev.clientX));
+        // Handles cannot cross -- the negative box's right edge can never
+        // pass the positive box's left edge, and vice versa.
+        if (isNeg) { negVal = Math.min(v, posVal); }
+        else { posVal = Math.max(v, negVal); }
+        render();
+      }
+      function onUp() {
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        post();
+      }
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+    });
+  }
+
+  renderTicks();
+  render();
+  post(); // record the default (empty/empty) state immediately on load
+  makeDraggable(handleNeg, true);
+  makeDraggable(handlePos, false);
+
+  // Let the parent know the iframe finished loading and is ready to receive
+  // a resize or other setup, if needed.
+  window.parent.postMessage({ type: "srx-boundary-ready" }, "*");
+})();
+</script>
+</body>
+</html>
