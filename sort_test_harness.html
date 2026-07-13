@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<!--
+  Sort task functionality tester -- for local use or sharing (e.g. host it
+  on GitHub Pages alongside sort.html and send the link). Do not paste this
+  into Qualtrics -- it's a dev/review tool, not part of the survey itself.
+
+  It mocks the Qualtrics.SurveyEngine API and re-implements the same
+  Stage-1 -> computeZoomRange -> Stage-2 logic that lives in
+  qualtrics_bridge/sort_bridge.js, so you can drive the real sort.html
+  widget through both stages and inspect the resulting embedded data (the
+  zoom_items and the range-label context chips) without needing a Qualtrics
+  survey wired up at all.
+
+  Works either as a local file or hosted -- the widget always loads over
+  the network from the "GitHub Pages base URL" field below regardless.
+
+  If you change the zoom/context logic in qualtrics_bridge/sort_bridge.js,
+  mirror the change in the computeZoomRange() function below too -- this
+  file is a separate copy for testing convenience, not a shared module.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Sort Bridge Test Harness</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 16px; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 32px; border-top: 1px solid #ddd; padding-top: 16px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .controls input { width: 340px; }
+  .status { font-size: 13px; font-weight: 600; color: #337ab7; margin: 6px 0; }
+  iframe { width: 100%; height: 260px; border: 1px solid #ccc; border-radius: 6px; }
+  #debugPanel {
+    background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 6px;
+    font-size: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap;
+  }
+  button { padding: 6px 14px; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.5; }
+</style>
+</head>
+<body>
+<h1>Sort Bridge Test Harness</h1>
+<p>Simulates Stage 1 → Stage 2 exactly as the real Qualtrics bridge script would, so you can check the adaptive zoom and range-label context chips without touching Qualtrics.</p>
+
+<div class="controls">
+  <label>GitHub Pages base URL:<br><input id="baseUrlInput" value="https://jamclee.github.io/scale-boundaries-study"></label>
+  <label>Scale condition:<br>
+    <select id="scaleSelect">
+      <option value="5">1–5</option>
+      <option value="6">1–6</option>
+      <option value="10">1–10</option>
+      <option value="100">0–100</option>
+    </select>
+  </label>
+  <button id="startBtn">Start Stage 1</button>
+</div>
+
+<h2>Stage 1</h2>
+<div id="stage1-status" class="status">not started</div>
+<div id="srx-iframe-container-1"></div>
+<button id="continueBtn" disabled>Continue to Stage 2 →</button>
+
+<h2>Stage 2</h2>
+<div id="stage2-status" class="status">not started</div>
+<div id="srx-iframe-container-2"></div>
+
+<h2>Embedded data (debug)</h2>
+<pre id="debugPanel">{}</pre>
+
+<script>
+(function () {
+  var EMBEDDED = {};
+
+  function updateDebug() {
+    document.getElementById("debugPanel").textContent = JSON.stringify(EMBEDDED, null, 2);
+  }
+
+  // ---- Mock of the Qualtrics.SurveyEngine API used by sort_bridge.js ----
+  var currentQuestionObject = null;
+  window.Qualtrics = {
+    SurveyEngine: {
+      getEmbeddedData: function (k) { return EMBEDDED[k]; },
+      setEmbeddedData: function (k, v) { EMBEDDED[k] = v; updateDebug(); },
+      addOnReady: function (fn) { fn.call(currentQuestionObject); },
+      addOnUnload: function () { /* no-op for this harness */ }
+    }
+  };
+
+  function makeQuestionObject(statusElId) {
+    return {
+      disableNextButton: function () { document.getElementById(statusElId).textContent = "Next: disabled"; },
+      enableNextButton: function () { document.getElementById(statusElId).textContent = "Next: ENABLED"; }
+    };
+  }
+
+  var SCALE_CONFIG = {
+    "5":   { scale_mode: "numeric", scale_min: "1", scale_max: "5",   scale_step: "0.1", sort_items: "1,2,3,4,5" },
+    "6":   { scale_mode: "numeric", scale_min: "1", scale_max: "6",   scale_step: "0.1", sort_items: "1,2,3,4,5,6" },
+    "10":  { scale_mode: "numeric", scale_min: "1", scale_max: "10",  scale_step: "0.1", sort_items: "1,2,3,4,5,6,7,8,9,10" },
+    "100": { scale_mode: "numeric", scale_min: "0", scale_max: "100", scale_step: "1",   sort_items: "0,10,20,30,40,50,60,70,80,90,100" }
+  };
+
+  function baseUrl() {
+    return document.getElementById("baseUrlInput").value.replace(/\/$/, "") + "/sort.html";
+  }
+
+  // ---- Same zoom/context logic as qualtrics_bridge/sort_bridge.js ----
+  var ADAPTIVE_SCALES = ["5", "6", "10", "100"];
+
+  function decimalsOf(step) {
+    var s = String(step);
+    var i = s.indexOf(".");
+    return i === -1 ? 0 : s.length - i - 1;
+  }
+
+  function computeZoomRange(assignments, resultPrefix, context) {
+    var scaleCondition = Qualtrics.SurveyEngine.getEmbeddedData("scale_condition");
+    if (ADAPTIVE_SCALES.indexOf(scaleCondition) === -1) return;
+
+    var numericItems = Object.keys(assignments).map(Number).sort(function (a, b) { return a - b; });
+    var negMax = null, posMin = null;
+    numericItems.forEach(function (v) {
+      var bin = assignments[String(v)];
+      if (bin === "negative") negMax = (negMax === null) ? v : Math.max(negMax, v);
+      if (bin === "positive" && posMin === null) posMin = v;
+    });
+
+    var zoomLow = null, zoomHigh = null;
+    if (negMax !== null) {
+      var nextAbove = numericItems.filter(function (v) { return v > negMax; })[0];
+      if (nextAbove !== undefined) { zoomLow = negMax; zoomHigh = nextAbove; }
+    }
+    if (posMin !== null) {
+      var below = numericItems.filter(function (v) { return v < posMin; });
+      var nextBelow = below[below.length - 1];
+      if (nextBelow !== undefined) {
+        zoomLow = (zoomLow === null) ? nextBelow : Math.min(zoomLow, nextBelow);
+        zoomHigh = (zoomHigh === null) ? posMin : Math.max(zoomHigh, posMin);
+      }
+    }
+
+    var zoomItems = [];
+    if (zoomLow !== null && zoomHigh !== null && numericItems.length > 1) {
+      var spacing = numericItems[1] - numericItems[0];
+      var step = spacing / 10;
+      var decimals = decimalsOf(parseFloat(step.toFixed(6)));
+      var count = Math.round((zoomHigh - zoomLow) / step) - 1;
+      for (var i = 1; i <= count; i++) {
+        zoomItems.push(parseFloat((zoomLow + i * step).toFixed(decimals)));
+      }
+
+      var fmt = function (v) { return v.toFixed(decimals); };
+      var scaleMin = parseFloat(Qualtrics.SurveyEngine.getEmbeddedData("scale_min"));
+      var scaleMax = parseFloat(Qualtrics.SurveyEngine.getEmbeddedData("scale_max"));
+
+      function rangeLabel(lo, hi) {
+        return lo === hi ? fmt(lo) : fmt(lo) + "-" + fmt(hi);
+      }
+
+      // Negative/positive only -- neutral stays empty in Stage 2 by design.
+      var contextNegative = negMax !== null ? [rangeLabel(scaleMin, negMax)] : [];
+      var contextPositive = posMin !== null ? [rangeLabel(posMin, scaleMax)] : [];
+      Qualtrics.SurveyEngine.setEmbeddedData(context + "_zoom_context_negative", contextNegative.join(","));
+      Qualtrics.SurveyEngine.setEmbeddedData(context + "_zoom_context_positive", contextPositive.join(","));
+    }
+    Qualtrics.SurveyEngine.setEmbeddedData(context + "_zoom_items", zoomItems.join(","));
+  }
+
+  // ---- Stage runners (mirrors qualtrics_bridge/sort_bridge.js's body) ----
+  function runStage1() {
+    var ITEM_FIELD = "sort_items";
+    var RESULT_PREFIX = "test_sort1_";
+    currentQuestionObject = makeQuestionObject("stage1-status");
+
+    Qualtrics.SurveyEngine.addOnReady(function () {
+      var qThis = this;
+      var itemsRaw = Qualtrics.SurveyEngine.getEmbeddedData(ITEM_FIELD) || "";
+      var container = document.getElementById("srx-iframe-container-1");
+      container.innerHTML = "";
+      qThis.disableNextButton();
+
+      var iframe = document.createElement("iframe");
+      iframe.src = baseUrl() + "?items=" + encodeURIComponent(itemsRaw);
+      container.appendChild(iframe);
+
+      window.addEventListener("message", function onMessage(e) {
+        if (e.source !== iframe.contentWindow || !e.data) return;
+        if (e.data.type === "srx-sort-progress") {
+          qThis.disableNextButton();
+        } else if (e.data.type === "srx-sort-complete") {
+          Object.keys(e.data.assignments).forEach(function (item) {
+            Qualtrics.SurveyEngine.setEmbeddedData(RESULT_PREFIX + item, e.data.assignments[item] || "");
+          });
+          computeZoomRange(e.data.assignments, RESULT_PREFIX, "test");
+          qThis.enableNextButton();
+          document.getElementById("continueBtn").disabled = false;
+        }
+      });
+    });
+  }
+
+  function runStage2() {
+    var ITEM_FIELD = "test_zoom_items";
+    var RESULT_PREFIX = "test_sort2_";
+    currentQuestionObject = makeQuestionObject("stage2-status");
+
+    Qualtrics.SurveyEngine.addOnReady(function () {
+      var qThis = this;
+      var itemsRaw = Qualtrics.SurveyEngine.getEmbeddedData(ITEM_FIELD) || "";
+      var container = document.getElementById("srx-iframe-container-2");
+      container.innerHTML = "";
+      qThis.disableNextButton();
+
+      if (!itemsRaw) {
+        container.innerHTML = "<p><em>No additional items to refine here.</em></p>";
+        qThis.enableNextButton();
+        return;
+      }
+
+      var urlParams = new URLSearchParams({ items: itemsRaw });
+      var ctxNeg = Qualtrics.SurveyEngine.getEmbeddedData("test_zoom_context_negative") || "";
+      var ctxPos = Qualtrics.SurveyEngine.getEmbeddedData("test_zoom_context_positive") || "";
+      if (ctxNeg) urlParams.set("context_negative", ctxNeg);
+      if (ctxPos) urlParams.set("context_positive", ctxPos);
+
+      var iframe = document.createElement("iframe");
+      iframe.src = baseUrl() + "?" + urlParams.toString();
+      container.appendChild(iframe);
+
+      window.addEventListener("message", function onMessage(e) {
+        if (e.source !== iframe.contentWindow || !e.data) return;
+        if (e.data.type === "srx-sort-progress") {
+          qThis.disableNextButton();
+        } else if (e.data.type === "srx-sort-complete") {
+          Object.keys(e.data.assignments).forEach(function (item) {
+            Qualtrics.SurveyEngine.setEmbeddedData(RESULT_PREFIX + item, e.data.assignments[item] || "");
+          });
+          qThis.enableNextButton();
+        }
+      });
+    });
+  }
+
+  document.getElementById("startBtn").addEventListener("click", function () {
+    EMBEDDED = {};
+    var scale = document.getElementById("scaleSelect").value;
+    Object.keys(SCALE_CONFIG[scale]).forEach(function (k) { EMBEDDED[k] = SCALE_CONFIG[scale][k]; });
+    EMBEDDED.scale_condition = scale;
+    updateDebug();
+
+    document.getElementById("srx-iframe-container-2").innerHTML = "";
+    document.getElementById("stage2-status").textContent = "not started";
+    document.getElementById("continueBtn").disabled = true;
+
+    runStage1();
+  });
+
+  document.getElementById("continueBtn").addEventListener("click", runStage2);
+})();
+</script>
+</body>
+</html>
